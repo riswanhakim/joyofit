@@ -1,0 +1,759 @@
+diff --git a/README.md b/README.md
+index 3c47c68..5610a62 100644
+--- a/README.md
++++ b/README.md
+@@ -117,6 +117,8 @@ flowchart LR
+ | Write steps, distance, calories, heart rate, SpO₂, resting HR, sleep and workouts to Health Connect (for JoyoRogo and others), also from the background service | implemented; unverified on the Fit 4 |
+ | Workouts (sport sessions): totals, heart rate, pace splits, swim data and the GPS track, shown in the Workouts tab (stats, heart-rate bars, route as an SVG polyline, no map) | implemented, ported from GB; unverified on the Fit 4 |
+ | Weather on the watch: current conditions and a 24 h / 8 day forecast from Open-Meteo (no key) for the phone's coarse location or a chosen city, pushed on connect, when the watch asks, and every hour (configurable) | implemented, ported from GB; unverified on the Fit 4 |
++| Music remote: the watch's music screen shows the artist, title, play state and volume of whatever plays on the phone (Spotify, YouTube Music, ...) and its play / pause / previous / next / volume buttons control it; needs notification access for the track info | implemented, ported from GB (service `0x25`, commands 01-03); untested on any watch |
++| Turn-by-turn on the watch: Google Maps and Waze guidance notifications are forwarded although ongoing, only when the instruction changes (distance countdowns are ignored), replacing the previous one | implemented; untested |
+ | Find my watch (phone → watch) from the Watch tab | implemented, ported from GB; unverified on the Fit 4 |
+ | Find my phone (watch → phone): loud ringtone on the alarm volume, vibration, notification with Stop; works from the background service | implemented, ported from GB; unverified on the Fit 4 |
+ | Incoming calls on the watch (caller name or number), accept / reject from the watch | implemented, ported from GB; unverified on the Fit 4 |
+diff --git a/modules/huawei-wear/android/src/main/java/com/joyodigitama/huaweiwear/MusicController.kt b/modules/huawei-wear/android/src/main/java/com/joyodigitama/huaweiwear/MusicController.kt
+new file mode 100644
+index 0000000..f7e392b
+--- /dev/null
++++ b/modules/huawei-wear/android/src/main/java/com/joyodigitama/huaweiwear/MusicController.kt
+@@ -0,0 +1,331 @@
++// Derived from Gadgetbridge (AGPL-3.0-or-later; see NOTICE): service/devices/huawei/AsynchronousResponse.handleMusicControls,
++// HuaweiSupportProvider.{onSetMusicState,onSetMusicInfo,sendSetMusic}, HuaweiMediaManager and requests/{SetMusicRequest,
++// SetMusicStatusRequest}.
++package com.joyodigitama.huaweiwear
++
++import android.content.BroadcastReceiver
++import android.content.ComponentName
++import android.content.Context
++import android.content.Intent
++import android.content.IntentFilter
++import android.media.AudioManager
++import android.media.MediaMetadata
++import android.media.session.MediaController
++import android.media.session.MediaSessionManager
++import android.media.session.PlaybackState
++import android.os.Build
++import android.os.Handler
++import android.os.Looper
++import android.os.SystemClock
++import android.view.KeyEvent
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
++import nodomain.freeyourgadget.gadgetbridge.devices.huawei.HuaweiPacket
++import nodomain.freeyourgadget.gadgetbridge.devices.huawei.packets.MusicControl
++
++/**
++ * The watch's music screen as a remote for whatever plays on the phone (Spotify, YouTube Music,
++ * ...): the phone sends artist, title, play state and volume (25/02); the watch sends its buttons
++ * and volume (25/03) and asks for the status when the screen opens (25/01).
++ *
++ * The playing app is found through Android's media sessions, which needs the notification access
++ * JoyoFit already asks for. Without it the buttons still work as media keys, but the watch shows no
++ * title.
++ */
++internal class MusicController(
++  context: Context,
++  private val link: WearLink,
++  private val events: WearEvents,
++  private val scope: CoroutineScope,
++) {
++  private val appContext = context.applicationContext
++  private val audio = appContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
++  private val sessions = appContext.getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
++  private val listenerComponent = ComponentName(appContext, WatchNotificationListener::class.java)
++  private val main = Handler(Looper.getMainLooper())
++
++  private var attached: HuaweiSession? = null
++  private val subscriptions = ArrayList<AutoCloseable>()
++
++  /** Main thread only: the session being followed and its callback. */
++  @Volatile private var controller: MediaController? = null
++  private var tracking = false
++  private var pushJob: Job? = null
++
++  /** What was last sent, so a repeat (state callbacks fire often) is not sent again. */
++  @Volatile private var lastSent: List<Any?>? = null
++
++  private fun log(message: String) = events.log(LogDirection.INFO, null, null, null, message)
++
++  private fun error(message: String) = events.log(LogDirection.ERROR, null, null, null, message)
++
++  @Synchronized
++  fun onLinkState(state: LinkState) {
++    when (state) {
++      LinkState.CONNECTED, LinkState.SYNCING -> {
++        val session = link.handle()?.session ?: return
++        if (session === attached) return
++        detach()
++        attached = session
++        subscriptions += session.subscribe(MusicControl.id, MusicControl.MusicStatusResponse.id, "music status") { onStatusAsked(it) }
++        subscriptions += session.subscribe(MusicControl.id, MusicControl.Control.id, "music control") { onButton(it) }
++        main.post { startTracking() }
++      }
++      LinkState.DISCONNECTED -> {
++        detach()
++        main.post { stopTracking() }
++      }
++      else -> Unit
++    }
++  }
++
++  private fun detach() {
++    subscriptions.forEach { it.close() }
++    subscriptions.clear()
++    attached = null
++    lastSent = null
++  }
++
++  // Watch -> phone
++
++  /** AsynchronousResponse.handleMusicControls, command 01. Runs on the read thread. */
++  private fun onStatusAsked(packet: HuaweiPacket) {
++    val status = try {
++      packet.parseTlv()
++      (packet as MusicControl.MusicStatusResponse).status
++    } catch (e: Exception) {
++      error("Music: could not parse the watch's status request: ${e.message}")
++      return
++    }
++    if (status != -1 && status != MusicControl.successValue) {
++      log("Music: the watch reported status 0x${Integer.toHexString(status)}, not answering")
++      return
++    }
++    scope.launch {
++      acknowledge(MusicControl.MusicStatusResponse.id)
++      main.post {
++        followActiveSession()
++        lastSent = null
++        schedulePush()
++      }
++    }
++  }
++
++  /** AsynchronousResponse.handleMusicControls, command 03. Runs on the read thread. */
++  private fun onButton(packet: HuaweiPacket) {
++    val resp = try {
++      packet.parseTlv()
++      packet as MusicControl.Control.Response
++    } catch (e: Exception) {
++      error("Music: could not parse the watch's button: ${e.message}")
++      return
++    }
++    val button = if (resp.buttonPresent) resp.button else null
++    val volume = if (resp.volumePresent) resp.volume.toInt() and 0xFF else null
++    if (button == null && volume == null) return
++    scope.launch {
++      main.post {
++        if (button != null && button != MusicControl.Control.Response.Button.Unknown) press(button)
++        if (volume != null) setVolume(volume)
++      }
++      acknowledge(MusicControl.Control.id)
++      // GB waits a moment so the player has changed state before the watch is updated.
++      delay(BUTTON_SETTLE_MS)
++      lastSent = null
++      pushNow()
++    }
++  }
++
++  /** Main thread. Uses the followed player when there is one, else a media key (reaches the last player). */
++  private fun press(button: MusicControl.Control.Response.Button) {
++    val controls = controller?.transportControls
++    log("Music: ${button.name} from the watch")
++    when (button) {
++      MusicControl.Control.Response.Button.Play -> controls?.play() ?: mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY)
++      MusicControl.Control.Response.Button.Pause -> controls?.pause() ?: mediaKey(KeyEvent.KEYCODE_MEDIA_PAUSE)
++      MusicControl.Control.Response.Button.Previous -> controls?.skipToPrevious() ?: mediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
++      MusicControl.Control.Response.Button.Next -> controls?.skipToNext() ?: mediaKey(KeyEvent.KEYCODE_MEDIA_NEXT)
++      MusicControl.Control.Response.Button.Volume_up ->
++        audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_RAISE, 0)
++      MusicControl.Control.Response.Button.Volume_down ->
++        audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_LOWER, 0)
++      else -> Unit
++    }
++  }
++
++  private fun mediaKey(code: Int) {
++    val now = SystemClock.uptimeMillis()
++    audio.dispatchMediaKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, code, 0))
++    audio.dispatchMediaKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, code, 0))
++  }
++
++  /** Same range checks as GB: a volume outside the stream's range is ignored. */
++  private fun setVolume(volume: Int) {
++    val max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
++    val min = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) audio.getStreamMinVolume(AudioManager.STREAM_MUSIC) else 0
++    if (volume !in min..max) {
++      log("Music: volume $volume from the watch ignored (range $min..$max)")
++      return
++    }
++    audio.setStreamVolume(AudioManager.STREAM_MUSIC, volume, 0)
++  }
++
++  private suspend fun acknowledge(commandId: Byte) {
++    val handle = link.handle() ?: return
++    try {
++      handle.session.send(MusicControl.MusicStatusRequest(handle.session.params, commandId, MusicControl.successValue), "MusicAck")
++    } catch (e: CancellationException) {
++      throw e
++    } catch (e: Exception) {
++      error("Music: acknowledgement not sent: ${e.message}")
++    }
++  }
++
++  // Phone -> watch
++
++  /** SetMusicRequest: artist, title, PlaybackState value, max and current STREAM_MUSIC volume. */
++  private suspend fun pushNow() {
++    val handle = link.handle() ?: return
++    val now = snapshot()
++    if (now == lastSent) return
++    lastSent = now
++    val (artist, title, state, max, volume) = now
++    try {
++      val packet = MusicControl.MusicInfo.Request(
++        handle.session.params, artist as String, title as String, state as Byte, max as Byte, volume as Byte,
++      )
++      val reply = handle.session.request(packet, Timeouts.QUERY_MS, "MusicInfo")
++      if (reply is MusicControl.MusicInfo.Response && !reply.ok) error("Music: ${reply.error}")
++    } catch (e: CancellationException) {
++      throw e
++    } catch (e: Exception) {
++      lastSent = null
++      error("Music: info not sent: ${e.message}")
++    }
++  }
++
++  private fun snapshot(): List<Any?> {
++    val c = controller
++    val meta = c?.metadata
++    val artist = meta?.getString(MediaMetadata.METADATA_KEY_ARTIST)
++      ?: meta?.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST) ?: ""
++    val title = meta?.getString(MediaMetadata.METADATA_KEY_TITLE)
++      ?: meta?.getString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE) ?: ""
++    val state = when (c?.playbackState?.state) {
++      PlaybackState.STATE_PLAYING, PlaybackState.STATE_BUFFERING -> PlaybackState.STATE_PLAYING
++      PlaybackState.STATE_PAUSED -> PlaybackState.STATE_PAUSED
++      PlaybackState.STATE_STOPPED -> PlaybackState.STATE_STOPPED
++      else -> PlaybackState.STATE_NONE
++    }
++    return listOf(
++      artist.take(MAX_TEXT),
++      title.take(MAX_TEXT),
++      state.toByte(),
++      audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC).toByte(),
++      audio.getStreamVolume(AudioManager.STREAM_MUSIC).toByte(),
++    )
++  }
++
++  /** Coalesces the bursts of callbacks a track change produces into one packet. */
++  private fun schedulePush() {
++    if (link.handle() == null) return
++    pushJob?.cancel()
++    pushJob = scope.launch {
++      delay(PUSH_DEBOUNCE_MS)
++      pushNow()
++    }
++  }
++
++  // Following the playing app (main thread)
++
++  private val sessionCallback = object : MediaController.Callback() {
++    override fun onMetadataChanged(metadata: MediaMetadata?) = schedulePush()
++
++    override fun onPlaybackStateChanged(state: PlaybackState?) {
++      // Another app may have started playing while this one paused.
++      followActiveSession()
++      schedulePush()
++    }
++
++    override fun onSessionDestroyed() {
++      followActiveSession()
++      schedulePush()
++    }
++  }
++
++  private val sessionsChanged = MediaSessionManager.OnActiveSessionsChangedListener {
++    followActiveSession()
++    schedulePush()
++  }
++
++  private val volumeReceiver = object : BroadcastReceiver() {
++    override fun onReceive(context: Context?, intent: Intent?) = schedulePush()
++  }
++
++  private fun startTracking() {
++    if (tracking) return
++    tracking = true
++    try {
++      sessions.addOnActiveSessionsChangedListener(sessionsChanged, listenerComponent, main)
++    } catch (e: SecurityException) {
++      log("Music: no notification access, the watch gets buttons but no track info")
++    }
++    val filter = IntentFilter(VOLUME_CHANGED_ACTION)
++    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
++      appContext.registerReceiver(volumeReceiver, filter, Context.RECEIVER_EXPORTED)
++    } else {
++      appContext.registerReceiver(volumeReceiver, filter)
++    }
++    followActiveSession()
++    schedulePush()
++  }
++
++  private fun stopTracking() {
++    if (!tracking) return
++    tracking = false
++    pushJob?.cancel()
++    try {
++      sessions.removeOnActiveSessionsChangedListener(sessionsChanged)
++    } catch (e: Exception) {
++      // Not registered (no notification access).
++    }
++    try {
++      appContext.unregisterReceiver(volumeReceiver)
++    } catch (e: IllegalArgumentException) {
++      // Not registered.
++    }
++    follow(null)
++  }
++
++  /** Picks the session that is playing, else the most recent one (Android lists them newest first). */
++  private fun followActiveSession() {
++    val active = try {
++      sessions.getActiveSessions(listenerComponent)
++    } catch (e: SecurityException) {
++      emptyList()
++    }
++    val pick = active.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING } ?: active.firstOrNull()
++    if (pick?.sessionToken != controller?.sessionToken) follow(pick)
++  }
++
++  private fun follow(next: MediaController?) {
++    controller?.unregisterCallback(sessionCallback)
++    controller = next
++    next?.registerCallback(sessionCallback, main)
++    if (next != null) log("Music: following ${next.packageName}")
++  }
++
++  private companion object {
++    const val BUTTON_SETTLE_MS = 500L
++    const val PUSH_DEBOUNCE_MS = 300L
++
++    /** Keeps the packet small; the watch only shows a line or two. */
++    const val MAX_TEXT = 64
++
++    /** AudioManager.VOLUME_CHANGED_ACTION, a hidden constant that the system still broadcasts. */
++    const val VOLUME_CHANGED_ACTION = "android.media.VOLUME_CHANGED_ACTION"
++  }
++}
+diff --git a/modules/huawei-wear/android/src/main/java/com/joyodigitama/huaweiwear/NotificationForwarder.kt b/modules/huawei-wear/android/src/main/java/com/joyodigitama/huaweiwear/NotificationForwarder.kt
+index 81d8543..ba598d7 100644
+--- a/modules/huawei-wear/android/src/main/java/com/joyodigitama/huaweiwear/NotificationForwarder.kt
++++ b/modules/huawei-wear/android/src/main/java/com/joyodigitama/huaweiwear/NotificationForwarder.kt
+@@ -54,6 +54,11 @@ internal class NotificationForwarder(
+     val body = (if (!big.isNullOrBlank()) big else extras?.getCharSequence(Notification.EXTRA_TEXT)?.toString())
+       ?.let(::sanitize)
+ 
++    if (NotificationPolicy.isNavigation(sbn.packageName, notification.category, notification.flags)) {
++      onNavigation(sbn, notification, title, body)
++      return
++    }
++
+     val reason = NotificationPolicy.skipReason(
+       notification.flags, notification.category, sbn.packageName, ownPackage, title, body,
+     )
+@@ -89,12 +94,57 @@ internal class NotificationForwarder(
+     scope.launch { send(spec) }
+   }
+ 
++  /** The navigation instruction last shown on the watch, removed when the next one arrives. */
++  private var lastNavigation: WatchNotification? = null
++
++  /**
++   * Google Maps / Waze guidance: skips the ongoing and local-only filters, sends only when the
++   * instruction changes (not on every distance update) and replaces the previous instruction on the
++   * watch. The app can still be switched off in the notification app list.
++   */
++  private fun onNavigation(sbn: StatusBarNotification, notification: Notification, title: String?, body: String?) {
++    if (title.isNullOrBlank() && body.isNullOrBlank()) return
++    if (settings.appChoice(sbn.packageName) == false) return
++    val key = NotificationPolicy.navigationKey(title, body)
++    val hash = listOf(key, sbn.packageName).hashCode()
++    val spec: WatchNotification
++    val previous: WatchNotification?
++    synchronized(lock) {
++      if (lastSent[sbn.key] == hash) return
++      if (lastSent.size > MAX_TRACKED) lastSent.clear()
++      lastSent[sbn.key] = hash
++      val appInfo = applicationInfo(sbn.packageName, notification.extras)
++      spec = WatchNotification(
++        id = nextId++,
++        key = sbn.key ?: "",
++        sourceAppId = sbn.packageName,
++        sourceName = appInfo?.let { label(it) } ?: sbn.packageName,
++        title = title,
++        body = body,
++        channelId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) notification.channelId else null,
++        category = notification.category,
++        whenMs = System.currentTimeMillis(),
++        isEmail = false,
++      )
++      previous = lastNavigation
++      lastNavigation = spec
++      if (previous != null) cache.remove(previous)
++      if (cache.size > 10) cache.poll()
++      cache.offer(spec)
++    }
++    scope.launch {
++      if (previous != null) remove(previous)
++      send(spec)
++    }
++  }
++
+   fun onRemoved(sbn: StatusBarNotification) {
+     val spec: WatchNotification?
+     synchronized(lock) {
+       lastSent.remove(sbn.key)
+       val found = cache.firstOrNull { it.key == sbn.key && it.sourceAppId == sbn.packageName }
+       if (found != null) cache.remove(found)
++      if (found != null && found.id == lastNavigation?.id) lastNavigation = null
+       spec = found
+     }
+     if (spec == null) return
+diff --git a/modules/huawei-wear/android/src/main/java/com/joyodigitama/huaweiwear/NotificationPolicy.kt b/modules/huawei-wear/android/src/main/java/com/joyodigitama/huaweiwear/NotificationPolicy.kt
+index a64c2f3..3559f6c 100644
+--- a/modules/huawei-wear/android/src/main/java/com/joyodigitama/huaweiwear/NotificationPolicy.kt
++++ b/modules/huawei-wear/android/src/main/java/com/joyodigitama/huaweiwear/NotificationPolicy.kt
+@@ -28,6 +28,45 @@ internal object NotificationPolicy {
+     else -> null
+   }
+ 
++  /**
++   * Turn-by-turn navigation apps whose ongoing navigation notification is forwarded anyway, so the
++   * watch shows the next instruction. Only a change of instruction is sent (see [navigationKey]).
++   */
++  val NAVIGATION_PACKAGES = setOf(
++    "com.google.android.apps.maps", // Google Maps
++    "com.waze", // Waze
++  )
++
++  /** `Notification.CATEGORY_NAVIGATION` (API 31); the literal so older phones match too. */
++  const val CATEGORY_NAVIGATION = "navigation"
++
++  /**
++   * A navigation app's live guidance notification: its navigation category, or an ongoing entry
++   * from that app (older Maps versions do not set the category). Other notifications of the same
++   * app, such as reviews or offers, take the normal path.
++   */
++  fun isNavigation(sourcePackage: String, category: String?, flags: Int): Boolean =
++    sourcePackage in NAVIGATION_PACKAGES &&
++      (category == CATEGORY_NAVIGATION || flags and ONGOING_MASK != 0)
++
++  /** Numbers with their units: "200 m", "1,2 km", "14:05", "12 menit". */
++  private val NUMBER_WITH_UNIT = Regex(
++    """\d[\d.,:]*\s*(km|m|mi|ft|yd|menit|mnt|min|jam|hr|h)?\b""",
++    RegexOption.IGNORE_CASE,
++  )
++
++  /**
++   * What identifies one navigation instruction: the text without distances and times. Maps reposts
++   * the notification as the distance counts down ("200 m" -> "150 m"); those reposts give the same
++   * key and are not sent, so the watch buzzes only when the next turn changes.
++   */
++  fun navigationKey(title: String?, body: String?): String =
++    listOfNotNull(title, body).joinToString("\n")
++      .replace(NUMBER_WITH_UNIT, "")
++      .replace(Regex("""\s+"""), " ")
++      .trim()
++      .lowercase()
++
+   /** An explicit per-app choice wins; otherwise every app is on except system apps. */
+   fun appAllowed(explicitChoice: Boolean?, isSystemApp: Boolean): Boolean = explicitChoice ?: !isSystemApp
+ 
+diff --git a/modules/huawei-wear/android/src/main/java/com/joyodigitama/huaweiwear/WearRuntime.kt b/modules/huawei-wear/android/src/main/java/com/joyodigitama/huaweiwear/WearRuntime.kt
+index 28536d0..3d60126 100644
+--- a/modules/huawei-wear/android/src/main/java/com/joyodigitama/huaweiwear/WearRuntime.kt
++++ b/modules/huawei-wear/android/src/main/java/com/joyodigitama/huaweiwear/WearRuntime.kt
+@@ -72,6 +72,7 @@ internal class WearRuntime private constructor(context: Context) {
+       if (state == LinkState.DISCONNECTED || state == LinkState.CONNECTED) controller?.onLinkChanged()
+       dataSync.onLinkState(state)
+       features.onLinkState(state)
++      music.onLinkState(state)
+       weather.onLinkState(state)
+       liveHeartRate.onLinkState(state)
+       stress.onLinkState(state)
+@@ -152,6 +153,7 @@ internal class WearRuntime private constructor(context: Context) {
+   }
+ 
+   val forwarder = NotificationForwarder(appContext, settings, link, events, scope)
++  val music = MusicController(appContext, link, events, scope)
+   val features = PhoneFeatures(appContext, PhoneFeatureSettings(appContext), link, events, scope, forwarder::nextMessageId)
+   val healthConnect = HealthConnectExporter(appContext, syncStore, events, scope)
+   val weatherSettings = WeatherSettings(appContext)
+diff --git a/modules/huawei-wear/android/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/HuaweiPacket.java b/modules/huawei-wear/android/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/HuaweiPacket.java
+index 3c8c733..702e443 100644
+--- a/modules/huawei-wear/android/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/HuaweiPacket.java
++++ b/modules/huawei-wear/android/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/HuaweiPacket.java
+@@ -49,6 +49,7 @@ import nodomain.freeyourgadget.gadgetbridge.devices.huawei.packets.Workout;
+ import nodomain.freeyourgadget.gadgetbridge.devices.huawei.packets.Weather;
+ import nodomain.freeyourgadget.gadgetbridge.devices.huawei.packets.FileUpload;
+ import nodomain.freeyourgadget.gadgetbridge.devices.huawei.packets.Watchface;
++import nodomain.freeyourgadget.gadgetbridge.devices.huawei.packets.MusicControl;
+ import nodomain.freeyourgadget.gadgetbridge.util.CheckSums;
+ 
+ public class HuaweiPacket {
+@@ -546,6 +547,18 @@ public class HuaweiPacket {
+                         this.isEncrypted = this.attemptDecrypt(); // Helps with debugging
+                         return this;
+                 }
++            case MusicControl.id:
++                switch (this.commandId) {
++                    case MusicControl.MusicStatusResponse.id:
++                        return new MusicControl.MusicStatusResponse(paramsProvider).fromPacket(this);
++                    case MusicControl.MusicInfo.id:
++                        return new MusicControl.MusicInfo.Response(paramsProvider).fromPacket(this);
++                    case MusicControl.Control.id:
++                        return new MusicControl.Control.Response(paramsProvider).fromPacket(this);
++                    default:
++                        this.isEncrypted = this.attemptDecrypt(); // Helps with debugging
++                        return this;
++                }
+             case FindPhone.id:
+                 if (this.commandId == FindPhone.Response.id)
+                     return new FindPhone.Response(paramsProvider).fromPacket(this);
+diff --git a/modules/huawei-wear/android/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/MusicControl.java b/modules/huawei-wear/android/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/MusicControl.java
+new file mode 100644
+index 0000000..e8b8b15
+--- /dev/null
++++ b/modules/huawei-wear/android/src/main/java/nodomain/freeyourgadget/gadgetbridge/devices/huawei/packets/MusicControl.java
+@@ -0,0 +1,199 @@
++/*  Copyright (C) 2024 Damien Gaignon, Martin.JM
++
++    This file is part of Gadgetbridge.
++
++    Gadgetbridge is free software: you can redistribute it and/or modify
++    it under the terms of the GNU Affero General Public License as published
++    by the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++
++    Gadgetbridge is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU Affero General Public License for more details.
++
++    You should have received a copy of the GNU Affero General Public License
++    along with this program.  If not, see <https://www.gnu.org/licenses/>. */
++package nodomain.freeyourgadget.gadgetbridge.devices.huawei.packets;
++
++import nodomain.freeyourgadget.gadgetbridge.devices.huawei.HuaweiPacket;
++import nodomain.freeyourgadget.gadgetbridge.devices.huawei.HuaweiTLV;
++
++/**
++ * Music control (service 0x25), ported from Gadgetbridge's packets/MusicControl.java. Only the
++ * remote-control part is kept: the watch asking for the music status (01), the phone sending the
++ * track and play state (02) and the watch's buttons (03). The music file upload and playlist
++ * commands (04 to 0D) are left out.
++ */
++public class MusicControl {
++    public static final byte id = 0x25;
++
++    public static final int successValue = 0x000186A0;
++
++    /** Phone -> watch acknowledgement of a 01 or 03 from the watch. */
++    public static class MusicStatusRequest extends HuaweiPacket {
++        public MusicStatusRequest(ParamsProvider paramsProvider, byte commandId, int returnValue) {
++            super(paramsProvider);
++
++            this.serviceId = MusicControl.id;
++            this.commandId = commandId;
++            this.tlv = new HuaweiTLV()
++                    .put(0x7F, returnValue);
++            this.isEncrypted = true;
++            this.complete = true;
++        }
++    }
++
++    /** Watch -> phone: the music screen was opened and wants the current status. */
++    public static class MusicStatusResponse extends HuaweiPacket {
++        public static final byte id = 0x01;
++
++        public int status = -1;
++
++        public MusicStatusResponse(ParamsProvider paramsProvider) {
++            super(paramsProvider);
++
++            this.serviceId = MusicControl.id;
++            this.commandId = id;
++        }
++
++        @Override
++        public void parseTlv() throws ParseException {
++            if (this.tlv.contains(0x7F) && this.tlv.getBytes(0x7F).length == 4)
++                this.status = this.tlv.getInteger(0x7F);
++        }
++    }
++
++    public static class MusicInfo {
++        public static final byte id = 0x02;
++
++        public static class Request extends HuaweiPacket {
++            public Request(
++                    ParamsProvider paramsProvider,
++                    String artistName,
++                    String songName,
++                    byte playState,
++                    byte maxVolume,
++                    byte currentVolume
++            ) {
++                super(paramsProvider);
++                this.serviceId = MusicControl.id;
++                this.commandId = id;
++                this.tlv = new HuaweiTLV()
++                        .put(0x01, artistName)
++                        .put(0x02, songName)
++                        .put(0x03, playState)
++                        .put(0x04, maxVolume)
++                        .put(0x05, currentVolume);
++                this.complete = true;
++            }
++        }
++
++        public static class Response extends HuaweiPacket {
++            public boolean ok = false;
++            public String error = "No input has been parsed yet";
++
++            public Response(ParamsProvider paramsProvider) {
++                super(paramsProvider);
++
++                this.serviceId = MusicControl.id;
++                this.commandId = id;
++
++                this.isEncrypted = true;
++            }
++
++            @Override
++            public void parseTlv() throws ParseException {
++                if (this.tlv.contains(0x7F)) {
++                    if (this.tlv.getInteger(0x7F) == successValue) {
++                        this.ok = true;
++                        this.error = "";
++                    } else {
++                        this.ok = false;
++                        this.error = "Music information error code: " + Integer.toHexString(this.tlv.getInteger(0x7F));
++                    }
++                } else {
++                    this.ok = false;
++                    this.error = "Music information response no status tag";
++                }
++            }
++        }
++    }
++
++    public static class Control {
++        public static final byte id = 0x03;
++
++        /** Watch -> phone: a button on the music screen, and/or a new volume. */
++        public static class Response extends HuaweiPacket {
++            public enum Button {
++                Unknown,
++                Play,
++                Pause,
++                Previous,
++                Next,
++                Volume_up,
++                Volume_down
++            }
++
++            public boolean buttonPresent = false;
++            public byte rawButton = 0x00;
++            public boolean volumePresent = false;
++            public byte volume = 0x00;
++
++            public Button button = null;
++
++            public Response(ParamsProvider paramsProvider) {
++                super(paramsProvider);
++
++                this.serviceId = MusicControl.id;
++                this.commandId = id;
++
++                this.isEncrypted = false;
++            }
++
++            @Override
++            public void parseTlv() throws ParseException {
++                if (this.tlv.contains(0x01)) {
++                    this.buttonPresent = true;
++                    // Only grab the lowest byte
++                    byte[] bytes = this.tlv.getBytes(0x01);
++                    this.rawButton = bytes[bytes.length - 1];
++                    switch (this.rawButton) {
++                        case 1:
++                            this.button = Button.Play;
++                            break;
++                        case 2:
++                            this.button = Button.Pause;
++                            break;
++                        case 3:
++                            this.button = Button.Previous;
++                            break;
++                        case 4:
++                            this.button = Button.Next;
++                            break;
++                        case 5:
++                            this.button = Button.Volume_up;
++                            break;
++                        case 6:
++                            this.button = Button.Volume_down;
++                            break;
++                        case 64:
++                            // Unknown button on Huawei Band 4
++                        case 100:
++                            // Seems like exit from music control screen to other screen
++                            this.buttonPresent = false;
++                        default:
++                            this.button = Button.Unknown;
++                    }
++                }
++
++                if (this.tlv.contains(0x02)) {
++                    this.volumePresent = true;
++                    // Only grab the lowest byte
++                    byte[] bytes = this.tlv.getBytes(0x02);
++                    this.volume = bytes[bytes.length - 1];
++                }
++            }
++        }
++    }
++}
+diff --git a/modules/huawei-wear/android/src/test/java/com/joyodigitama/huaweiwear/NotificationPolicyTest.kt b/modules/huawei-wear/android/src/test/java/com/joyodigitama/huaweiwear/NotificationPolicyTest.kt
+index 6320fc9..1bec014 100644
+--- a/modules/huawei-wear/android/src/test/java/com/joyodigitama/huaweiwear/NotificationPolicyTest.kt
++++ b/modules/huawei-wear/android/src/test/java/com/joyodigitama/huaweiwear/NotificationPolicyTest.kt
+@@ -53,4 +53,24 @@ class NotificationPolicyTest {
+     assertFalse(NotificationPolicy.isSystemApp(ApplicationInfo.FLAG_SYSTEM or ApplicationInfo.FLAG_UPDATED_SYSTEM_APP))
+     assertFalse(NotificationPolicy.isSystemApp(0))
+   }
++
++  @Test
++  fun mapsGuidanceIsNavigationButOtherMapsNotificationsAreNot() {
++    val maps = "com.google.android.apps.maps"
++    assertTrue(NotificationPolicy.isNavigation(maps, "navigation", 0))
++    assertTrue(NotificationPolicy.isNavigation(maps, null, Notification.FLAG_ONGOING_EVENT))
++    assertFalse(NotificationPolicy.isNavigation(maps, null, 0))
++    assertFalse(NotificationPolicy.isNavigation("com.chat", "navigation", Notification.FLAG_ONGOING_EVENT))
++  }
++
++  @Test
++  fun distanceCountdownKeepsTheSameKeyButANewTurnChangesIt() {
++    val a = NotificationPolicy.navigationKey("Belok kiri dalam 200 m", "Jl. Sudirman · 12 menit · 3,4 km · tiba 14:05")
++    val b = NotificationPolicy.navigationKey("Belok kiri dalam 150 m", "Jl. Sudirman · 11 menit · 3,3 km · tiba 14:05")
++    val c = NotificationPolicy.navigationKey("Belok kiri dalam 1,2 km", "Jl. Sudirman · 11 menit · 3,3 km · tiba 14:06")
++    val d = NotificationPolicy.navigationKey("Belok kanan dalam 300 m", "Jl. Thamrin · 10 menit · 2,9 km · tiba 14:06")
++    assertEquals(a, b)
++    assertEquals(a, c)
++    assertTrue(a != d)
++  }
+ }
